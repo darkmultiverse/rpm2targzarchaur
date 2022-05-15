@@ -1,0 +1,10 @@
+We've accumulated too many patches/fixups/etc... to keep our sanity, so
+rpm2targz is now maintained in a git repo which we make releases from (so
+hopefully other distros can take advantage of things).
+
+You can find that repository here:
+http://git.overlays.gentoo.org/gitweb/?p=proj/rpm2targz.git;a=summary
+
+The versioning schema is simple.  Just append '.0.#g' to the upstream version
+(which in this case is '9.0').  Increment the '#' over time.  The 'g' is short
+for Gentoo.  Awesome.

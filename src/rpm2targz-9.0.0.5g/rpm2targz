@@ -1,0 +1,202 @@
+#!/bin/sh
+# Copyright 1997, 1998 Patrick Volkerding, Moorhead, MN USA
+# Copyright 2002 Slackware Linux, Inc., Concord, CA USA
+# All rights reserved.
+#
+# Redistribution and use of this script, with or without modification, is
+# permitted provided that the following conditions are met:
+#
+# 1. Redistributions of this script must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED
+#  WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+#  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO
+#  EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+#  PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+#  OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+#  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+#  OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+#  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+argv0=${0##*/}
+warn() { echo "${argv0}: warning: $*" 1>&2; }
+err()  { echo "${argv0}: warning: $*" 1>&2; exit 1; }
+
+usage=false
+stdout=false
+verbose=false
+strip=false
+files=false
+msg=""
+for opt; do
+	case ${opt} in
+		-h|--help)       usage=true;;
+		-O|--stdout)     stdout=true;;
+		-v|--verbose)    verbose=true;;
+		-S|--strip-path) strip=true;;
+		--)              break;;
+		-*)              usage=true msg="unknown option '${opt}'";;
+		*)               files=true;;
+	esac
+done
+
+if ! ${files} || ${usage} ; then
+	cat <<-EOF
+	${argv0}: Converts RPM archives to tar archives
+
+	Usage: ${argv0} [options] <rpms>
+
+	Options:
+	  -h, --help       This help screen (imagine that)
+	  -O, --stdout     Write tarball to stdout
+	  -S, --strip-path Strip package name from tarball
+	  -v, --verbose    Verbose output
+	EOF
+
+	if [ -n "${msg}" ] ; then
+		err "${msg}"
+	else
+		exit 0
+	fi
+fi
+
+# allow for local development
+if [ "${0#./}" != "${0}" -a -x "./rpmoffset" ] ; then
+	rpmoffset="./rpmoffset"
+else
+	rpmoffset="rpmoffset"
+fi
+
+compress="cat"
+case ${argv0#rpm} in
+	unpack)                    suffix="";;
+	2tar)                      suffix=".tar";;
+	2tarbz2)  compress="bzip2" suffix=".tar.bz2";;
+	2tbz2)    compress="bzip2" suffix=".tbz2";;
+	2tarlzma) compress="lzma"  suffix=".tar.lzma";;
+	2tgz)     compress="gzip"  suffix=".tgz";;
+	2tarxz)   compress="xz"    suffix=".tar.xz";;
+	2txz)     compress="xz"    suffix=".txz";;
+	2targz|*) compress="gzip"  suffix=".tar.gz";;
+esac
+case ${argv0} in
+	rpm2tar*) strip=true;;
+esac
+
+# try to get a temp dir using progressively older/crappier methods
+WORKDIR=""
+trap 'rm -rf "${WORKDIR}"' 0
+
+WORKDIR=$(mktemp -d --tmpdir ${argv0}.XXXXXX 2>/dev/null)
+if [ -z "${WORKDIR}" ] ; then
+	WORKDIR=$(mktemp -d -t ${argv0}.XXXXXX 2>/dev/null)
+	if [ -z "${WORKDIR}" ] ; then
+		[ -z "${TMPDIR}" ] && TMPDIR="/tmp"
+		WORKDIR=$(mcookie 2>/dev/null)
+		if [ -n "${WORKDIR}" ] ; then
+			WORKDIR="${TMPDIR}/${WORKDIR}"
+		else
+			WORKDIR="${TMPDIR}/$$"
+		fi
+
+		worked=false
+		if rm -rf "${WORKDIR}" ; then
+			if mkdir -m 700 -p "${WORKDIR}" ; then
+				worked=true
+			elif mkdir -p "${WORKDIR}" ; then
+				if chmod 700 "${WORKDIR}" ; then
+					worked=true
+				fi
+			fi
+		fi
+		if ! ${worked} ; then
+			err "${WORKDIR}: unable to create a temp directory"
+		fi
+	fi
+fi
+
+ret=0
+dashdash=false
+for file; do
+	if ! ${dashdash} ; then
+		case ${file} in
+			-v|--verbose) continue;;
+			-O|--stdout) continue;;
+			-S|--strip-path) continue;;
+			--) dashdash=true; continue;;
+		esac
+	fi
+
+	${verbose} && printf "Processing file: ${file} ... "
+
+	outfile=${file##*/}
+	outfile=${outfile%.rpm}
+	${strip} && base="" || base=${outfile%.src}
+	DEST="${WORKDIR}/${base}"
+	rm -rf "${DEST}"
+	if ! mkdir "${DEST}" ; then
+		rm -rf "${WORKDIR}" &
+		err "${file}: ${DEST}: unable to create working directory"
+	fi
+
+	# extract the CPIO from the RPM and unpack it
+	(
+		decompressor=""
+		# Disable rpm2cpio as it might be broken #249769,
+		# or it might be too old #292057
+		#if command -v rpm2cpio >/dev/null 2>&1 ; then
+		if false ; then
+			decompressor="rpm2cpio"
+			rpm2cpio "${file}"
+		else
+			# do it by hand :/
+			set -- $(${rpmoffset} -v < "${file}")
+			decompressor=$1
+			offset=$2
+			[ -z "${offset}" ] && err "unable to locate cpio offset (broken/unknown compression?)"
+			dd ibs=${offset} skip=1 if="${file}" 2>/dev/null | ${decompressor} -dc
+		fi
+		[ $? -ne 0 ] && echo "${argv0}: ${file}: failed to extract cpio via ${decompressor} (not actually an RPM?)" 1>&2
+	) | (
+		cd "${DEST}"
+		# filter stupid blocks info from cpio
+		cpio -i -m -d 2>/dev/null
+	)
+
+	if [ $? -ne 0 ] ; then
+		false
+	elif [ -n "${suffix}" ] ; then
+		# repack the files into the appropriate tar file
+		(
+			cd "${WORKDIR}"
+			tar cf - "./${base}"
+		) | ${compress} | (
+			if ${stdout} ; then
+				cat
+			else
+				cat > "${outfile}${suffix}"
+			fi
+		)
+	else
+		# just unpacking, so move the files
+		cp -pPR "${DEST}/" ./
+	fi
+	tret=$?
+	if [ ${tret} -eq 0 ] ; then
+		msg=OK
+	else
+		ret=${tret}
+		msg=FAIL
+	fi
+	${verbose} && echo ${msg}
+
+	rm -rf "${DEST}"
+done
+
+# No need for this as the trap will take care of it
+#rm -rf "${WORKDIR}"
+
+exit ${ret}
